@@ -1,0 +1,199 @@
+// The modified model that mitigates the issue with the operation of the system,
+// including the safety and liveness properties.
+//
+// @author 			Si Yong Lim
+// @date 			23/04/2025
+
+// --------------------------------- CONSTANTS & RANGE DEFINITIONS ---------------------------------
+const NUM_STATIONS 	 = 3
+// Maximum number of carts possiblly existing in the system at once. This is the minimum number that
+// can lead to a deadlock because lower numbers will not create a bottleneck. Higher values are 
+// redundant as producer will still have to wait for another cart to descend before arriving.
+// However, it might take a long time to compose for a large number of stations (e.g. 4). In that 
+// case, set MAX_CARTS to a fixed constant (e.g. 5) to reduce the composition time while maintaining
+// the number of stations.
+const MAX_CARTS    	 = 2 * (NUM_STATIONS - 1) + 5
+const MAX_STATION_ID = NUM_STATIONS - 1
+range STATIONS     	 = 0..MAX_STATION_ID
+range CARTS        	 = 1..MAX_CARTS
+range ENGINES      	 = 0..NUM_STATIONS
+
+// -------------------------------------- PROCESS DEFINITIONS --------------------------------------
+// PRODUCER generates carts infinitely one after another using `c % MAX_CARTS + 1` to reuse cartIDs.
+PRODUCER = PRODUCER[1],
+PRODUCER[c:CARTS] =
+	( cart[c][0].arrives_at_the_mines -> elevator_descends_with_cart[c][0]
+	-> PRODUCER[c % MAX_CARTS + 1] ).
+
+// CONSUMER removes carts from the mines that have visited all the stations and are back at the top
+// of the elevator.
+CONSUMER =
+	( elevator_ascends_with_cart[c:CARTS][NUM_STATIONS]
+	-> cart[c][NUM_STATIONS].departs_from_the_mines -> CONSUMER ).
+
+// Each cart travels from arrival at the mines to departure. All remaining tasks in beteween will
+// be handled by other processes.
+CART(C = 0) =
+	( cart[C][0].arrives_at_the_mines -> elevator_descends_with_cart[C][0]
+	-> elevator_ascends_with_cart[C][NUM_STATIONS] -> cart[C][NUM_STATIONS].departs_from_the_mines
+	-> CART ).
+
+// ELEVATOR transitions between the top and the bottom. It can move carts or move empty.
+ELEVATOR = ELEVATOR_TOP,
+ELEVATOR_TOP =
+	( elevator_descends_with_cart[c:CARTS][0] -> cart[c][0].collected_from_elevator
+	-> ELEVATOR_BOTTOM
+	| elevator_descends_empty -> ELEVATOR_BOTTOM ),
+// Locks elevator until departure from the mines before it can be used by the next cart.
+ELEVATOR_BOTTOM =
+	( cart[c:CARTS][NUM_STATIONS].delivered_to_elevator
+	-> elevator_ascends_with_cart[c][NUM_STATIONS] -> cart[c][NUM_STATIONS].departs_from_the_mines
+	-> ELEVATOR_TOP
+	| elevator_ascends_empty -> ELEVATOR_TOP ).
+
+// STATION accepts a cart, loads a gem, and waits for it to be collected.
+STATION(S = 0) =
+	( cart[c:CARTS][S].delivered_to_station[S] -> cart[c][S + 1].loaded_with_a_gem
+	-> cart[c][S + 1].collected_from_station[S] -> STATION ).
+
+// MINER mines a gem only when the station is empty and not yet loaded.
+MINER(S = 0) =
+	( miner[S].mines_gem -> cart[c:CARTS][S + 1].loaded_with_a_gem -> MINER ).
+
+// ELEVATOR_OPERATOR sends empty elevator up or down at any time.
+ELEVATOR_OPERATOR =
+	( elevator_ascends_empty -> ELEVATOR_OPERATOR | elevator_descends_empty -> ELEVATOR_OPERATOR ).
+
+// Each ENGINE moves a cart from one station to the next or between station and elevator. Defined as
+// a parameterized process instead of a prefixed process because the prefix and its number is fixed
+// across the process and hence cannot enforce the delivery to station[N + 1].
+ENGINE(N = 0) =
+	( when (N == 0)
+		cart[c:CARTS][0].collected_from_elevator -> cart[c][0].delivered_to_station[N] -> ENGINE 
+	| when (N > 0 && N < NUM_STATIONS)
+		cart[c:CARTS][N].collected_from_station[N - 1] -> cart[c][N].delivered_to_station[N]
+		-> ENGINE
+	| when (N == NUM_STATIONS)
+		cart[c:CARTS][N].collected_from_station[N - 1]
+		-> cart[c][N].delivered_to_elevator -> ENGINE ).
+
+// ------------------------------------ MODIFICATION TO SYSTEM -------------------------------------
+// This process ensures that if a cart has arrived at the mines, the elevator must pick it up and
+// cannot descend empty, regardless of whether the cart is waiting for the elevator. Similarly, if a
+// cart has been collected by the last engine and is about to to ascend, the elevator must wait and
+// pick it up and cannot ascend empty, regardless of whether the cart is waiting for the elevator.
+// It's defined separately from the ELEVATOR process to avoid blocking the arrival of new carts.
+// Combining this logic directly with the ELEVATOR would cause a deadlock by preventing other carts
+// from arriving until the current cart is fully handled.
+ELEVATOR_ASCEND_ASSUMPTION
+  = ( cart[c:CARTS][0].arrives_at_the_mines -> elevator_descends_with_cart[c][0]
+		-> ELEVATOR_ASCEND_ASSUMPTION
+	| elevator_descends_empty -> ELEVATOR_ASCEND_ASSUMPTION ).
+
+ELEVATOR_DESCEND_ASSUMPTION
+  = ( cart[c:CARTS][NUM_STATIONS].collected_from_station[MAX_STATION_ID]
+		-> cart[c][NUM_STATIONS].delivered_to_elevator -> ELEVATOR_DESCEND_ASSUMPTION
+	| elevator_ascends_empty -> ELEVATOR_DESCEND_ASSUMPTION ).
+
+||ELEVATOR_MODIFIED = ( ELEVATOR || ELEVATOR_ASCEND_ASSUMPTION || ELEVATOR_DESCEND_ASSUMPTION ).
+
+||MINES_OF_SEMAPHORIA =
+	(  PRODUCER
+	|| CONSUMER
+	|| ELEVATOR_MODIFIED
+	|| ELEVATOR_OPERATOR
+	|| forall[c:CARTS]    ( CART(c)    )
+	|| forall[e:ENGINES]  ( ENGINE(e)  )
+	|| forall[s:STATIONS] ( STATION(s) )
+	|| forall[s:STATIONS] ( MINER(s)   )
+	).
+
+// --------------------------------- SAFETY PROPERTIES DEFINITIONS ---------------------------------
+// Each engine can only carry a single cart at a time.
+property SAFE_ENGINE(S = 0) =
+	( when (S == 0)
+		cart[c:CARTS][S].collected_from_elevator -> cart[c][S].delivered_to_station[S]
+		-> SAFE_ENGINE
+	| when (S > 0 && S < NUM_STATIONS)
+		cart[c:CARTS][S].collected_from_station[S - 1] -> cart[c][S].delivered_to_station[S]
+		-> SAFE_ENGINE
+	| when (S == NUM_STATIONS)
+		cart[c:CARTS][S].collected_from_station[S - 1] -> cart[c][S].delivered_to_elevator
+		-> SAFE_ENGINE ).
+
+// Each station can only be occupied by a single cart at a time.
+property SAFE_STATION(S = 0) =
+	( cart[c:CARTS][S].delivered_to_station[S] -> cart[c][S + 1].collected_from_station[S]
+	-> SAFE_STATION ).
+
+// Each station can only hold a single gem at a time.
+property SAFE_GEM(S = 0) = 
+	( miner[S].mines_gem -> cart[c:CARTS][S + 1].loaded_with_a_gem -> SAFE_GEM ).
+
+// Each cart travels around the underground track in the same direction.
+property SAFE_CART(C = 1) =
+	(  cart[C][0].arrives_at_the_mines -> elevator_descends_with_cart[C][0]
+	-> cart[C][0].collected_from_elevator -> cart[C][0].delivered_to_station[0]
+	-> cart[C][1].loaded_with_a_gem -> cart[C][1].collected_from_station[0]
+	-> SAFE_CART_REPEAT[1] ),
+SAFE_CART_REPEAT[s:STATIONS] =
+	( when (s < MAX_STATION_ID)
+		cart[C][s].delivered_to_station[s] -> cart[C][s + 1].loaded_with_a_gem
+		-> cart[C][s + 1].collected_from_station[s] -> SAFE_CART_REPEAT[s + 1]
+	| when (s == MAX_STATION_ID)
+		cart[C][s].delivered_to_station[s] -> SAFE_CART_END ),
+SAFE_CART_END =
+	(  cart[C][NUM_STATIONS].loaded_with_a_gem
+	-> cart[C][NUM_STATIONS].collected_from_station[MAX_STATION_ID]
+	-> cart[C][NUM_STATIONS].delivered_to_elevator -> elevator_ascends_with_cart[C][NUM_STATIONS] 
+	-> cart[C][NUM_STATIONS].departs_from_the_mines
+	-> SAFE_CART ).
+
+// The elevator can only carry a single cart at a time.
+property SAFE_ELEVATOR =
+	( elevator_descends_with_cart[c:CARTS][0] -> cart[c][0].collected_from_elevator -> SAFE_ELEVATOR
+	| cart[c:CARTS][NUM_STATIONS].delivered_to_elevator
+		-> elevator_ascends_with_cart[c][NUM_STATIONS]
+		-> cart[c][NUM_STATIONS].departs_from_the_mines -> SAFE_ELEVATOR ).
+
+// Carts should arrive at the mines infinitely.
+// No safety property. Check if there are any deadlocks using LTSA's default safety check.
+
+||PROPERTIES =
+	(  forall[c:CARTS] 	  ( SAFE_CART(c)    )
+	|| forall[e:ENGINES]  ( SAFE_ENGINE(e)  )
+	|| forall[s:STATIONS] ( SAFE_STATION(s) )
+	|| forall[s:STATIONS] ( SAFE_GEM(s)     )
+	|| SAFE_ELEVATOR ).
+
+// -------------------------------- LIVENESS PROPERTIES DEFINITIONS --------------------------------
+// Some carts that enter the mines should eventually exit with a full cart.
+progress LIVE_CART =
+	{ cart[c:CARTS][NUM_STATIONS].departs_from_the_mines }
+
+// Some stations are eventually visited by a cart.
+progress LIVE_STATION =
+	{ cart[c:CARTS][s:STATIONS].delivered_to_station[s:STATIONS] } 
+
+// Some gems placed at stations are eventually loaded.
+progress LIVE_GEM =
+	{ cart[c:CARTS][s:STATIONS].loaded_with_a_gem }
+
+// If a cart is waiting at the top, the elevator eventually arrives to descend it.
+progress LIVE_ELEVATOR_TOP =
+	{ elevator_descends_with_cart[c:CARTS][0] }
+
+// If a cart is waiting at the bottom, the elevator eventually arrives to ascend it.
+progress LIVE_ELEVATOR_BOTTOM =
+	{ elevator_ascends_with_cart[c:CARTS][NUM_STATIONS] }
+
+// An elevator operator eventually sends the elevator up when it is empty.
+progress LIVE_OPERATOR_ASCEND =
+	{ elevator_ascends_empty }
+
+// An elevator operator eventually sends the elevator down when it is empty.
+progress LIVE_OPERATOR_DESCEND =
+	{ elevator_descends_empty }
+
+// --------------------------------- SYSTEM COMPOSITION DEFINITIONS --------------------------------
+||MINES_OF_SEMAPHORIA_WITH_PROPERTIES = ( MINES_OF_SEMAPHORIA || PROPERTIES ).
